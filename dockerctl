@@ -1,0 +1,255 @@
+#!/bin/bash
+
+# From: https://gist.githubusercontent.com/fulup-bzh/8fd32c8cde9a1e5ec971/raw/8efc51f2a303819f61a9bee69676d67876c542b6/docker-start.sh
+# Author:  Odin Lee
+# Date:    Feb-2016
+# Oject:   Start a Docker container with IP addr deducted from hostname & DNS
+# Syntax:  dockerctl start|stop [image=odin] [bridge=br0] [subnet=10.20.1.0] [netmask=24] [addr=auto] [gateway=auto] [hosts=path_to_host] [data=path_to_data_dir] [cmd=xxx] FQDN
+# Licence: Any OpenSource Licences you like, until you fix bugs by yourself :)
+
+# Source:     https://gist.github.com/fulup-bzh
+# Reference:  http://blog.oddbit.com/2014/08/11/four-ways-to-connect-a-docker
+
+# sys commands
+# ---------------
+_ip=/usr/sbin/ip
+_docker=/usr/bin/docker
+_awk=/usr/bin/awk
+_getent=/usr/bin/getent
+_grep=/usr/bin/grep
+_nsenter=/usr/bin/nsenter
+_cat=/usr/bin/cat
+_ovsctl=/usr/bin/ovs-vsctl
+_md5=/usr/bin/md5sum
+
+
+# Default Values
+# ----------------
+ACTION="unknown"
+DBRIDGE=ovsbr0
+NETMASK=24
+SUBNET=10.0.0.0
+IMAGE="odin/hadoop:datanode"
+HOSTSFILE="/etc/hosts"
+DATADIR=""
+CMD="/lib/systemd/systemd"
+
+# Check if argument exist
+# --------------------------
+OPTCOUNT=0
+CheckArg() {
+    cmd=$(echo $1 | cut -f1 -d=)
+    val=$(echo $1 | cut -f2 -d=)
+    OPTCOUNT=`expr ${OPTCOUNT} + 1`
+
+    if test "${val}" != "auto"; then
+        case "${cmd}" in
+        bridge)   BRIDGE="${val}"  ;;
+        addr)     CADDR="${val}"   ;;
+        gateway)  GATEWAY="${val}" ;;
+        subnet)   SUBNET="${val}"  ;;
+        netmask)  NETMASK="${val}" ;;
+        image)    IMAGE="${val}" ;;
+        hosts)    HOSTSFILE="${val}" ;;     ## -v ${hosts}:/etc/hosts
+        data)     DATADIR="${val}" ;;       ## -v ${DATADIR}:/data
+        cmd)      CMD="${val}" ;;           ## container运行的命令
+
+        *) 
+            echo "Unknown option: ${cmd}=${val}"
+            exit 1
+            ;;
+        esac
+    fi
+}
+
+# 解析动作
+if expr 'index' "$1" '=' '=' '0' >/dev/null
+then
+    case $1 in
+    start)  ACTION="start" ;;
+    stop)   ACTION="stop" ;;
+    esac
+    shift 1
+else
+    echo "Syntaxe: dockerctl start|stop [image=xxx] [bridge=xx] [addr=x.x.x.x] [gateway=x.x.x.x] [subnet=x.x.x.0] [netmask=xx] [hosts=path_to_host] [data=path_to_data_dir] [cmd=xxx] FQDN"
+    exit 1
+fi
+
+# Extract Argument
+for arg in "$@"
+do
+    if expr 'index' "$arg" '=' '>' '1' >/dev/null; then
+        CheckArg "${arg}"
+    fi
+done
+
+# somehting abount FQDN
+# ---------------------
+shift ${OPTCOUNT}; FQDN=$1
+if test -z "${FQDN}"; then
+    echo "Syntaxe: dockerctl start|stop [image=xxx] [bridge=xx] [addr=x.x.x.x] [gateway=x.x.x.x] [subnet=x.x.x.0] [netmask=xx] [hosts=path_to_host] [data=path_to_data_dir] [cmd=xxx] FQDN"
+    exit 1
+fi
+
+# 短域名作为container名称
+CNAME=$(echo "${FQDN}" | cut -d. -f1)
+
+md5sum=$(${_md5} <<< "${CNAME}")
+# checksum
+CS=${md5sum:0:8}
+# container net interface name
+CNETNAME="veth${CS}"
+
+# check container status
+# -----------------
+DOCKRUNNING=`${_docker} ps -f status=running -f names=${CNAME} | ${_grep} ${CNAME}`
+DOCKSTOP=`${_docker} ps -f status=exited -f names=${CNAME} | ${_grep} ${CNAME}`
+
+case ${ACTION} in
+start)  # 启动操作
+
+    ## check if already running
+    if test ! -z "${DOCKRUNNING}"; then 
+        echo "Error: container=[${CNAME}] already running"
+        exit 1
+    fi
+
+    ## check bridge
+    if test -z "${BRIDGE}" && test ! -z "${DOCKSTOP}"; then # 优先从现存container中找到gateway信息
+        BRIDGE=`${_docker} inspect --format {{.Config.Labels.bridge}} ${CNAME}`  # get container namespace PID
+        if [ ${BRIDGE} == "<no value>" ]; then
+            BRIDGE=""
+        fi
+    fi
+    if test -z "$BRIDGE"; then # 还为空就是用默认值
+        BRIDGE=${DBRIDGE}
+    fi
+    ${_ip} link show ${BRIDGE} >/dev/null
+    if test $? -ne 0; then
+        echo "Error: bridge=${BRIDGE} does not exist"
+        exit 1
+    fi
+
+    ## 如果没有输入网关
+    if test -z "${GATEWAY}" && test ! -z "${DOCKSTOP}"; then # 优先从现存container中找到gateway信息
+        GATEWAY=`${_docker} inspect --format {{.Config.Labels.gateway}} ${CNAME}`  # get container namespace PID
+        if [ ${GATEWAY} == "<no value>" ]; then
+            GATEWAY=""
+        fi
+    fi
+    if test -z "${GATEWAY}"; then
+        GATEWAY=`${_ip} route show 0.0.0.0/0 dev ${BRIDGE} | ${_awk} '{print $3}'`
+        if test -z "${GATEWAY}"; then
+            GATEWAY=`${_ip} route show ${SUBNET}/${NETMASK} dev ${BRIDGE} | ${_awk} '{print $7}'`
+            # 仍然找不到, 报错退出
+            if test -z "${GATEWAY}"; then
+                echo "Error: no default gateway for ${BRIDGE}"
+                exit 1
+            fi
+        fi
+    fi
+
+
+    # if no IP provided get one from DNS lookup(or hosts file)
+    if test -z "${CADDR}" && test ! -z "${DOCKSTOP}"; then # 优先从现存container中找到gateway信息
+        CADDR=`${_docker} inspect --format {{.Config.Labels.addr}} ${CNAME}`  # get container namespace PID
+        if [ ${CADDR} == "<no value>" ]; then
+            CADDR=""
+        fi
+    fi
+    if test -z "${CADDR}"; then
+        CADDR=`${_getent} hosts ${FQDN} | ${_awk} '{print $1}'`
+        if test -z "${CADDR}"; then
+            echo "Error: host=${FQDN} no IP found"
+            exit 1
+        fi
+    fi
+
+    echo "Starting the container(name=${CNAME} addr=${CADDR}/${NETMASK})..."
+
+    if test -z "${DOCKSTOP}"; then
+        # bind volume
+        VPARA=""
+        if test ! -z "${HOSTSFILE}"; then
+            VPARA="${VPARA} -v ${HOSTSFILE}:/etc/hosts"
+        fi
+        if test ! -z "${DATADIR}"; then
+            VPARA="${VPARA} -v ${DATADIR}:/data"
+        fi
+        # custom metadata
+        CMPARA="--label bridge=${BRIDGE} --label addr=${CADDR} --label gateway=${GATEWAY} --label netmask=${NETMASK}"
+        ${_docker} run -dit --name="${CNAME}" --hostname="${FQDN}" ${CMPARA} --net=none --privileged ${VPARA} ${IMAGE} ${CMD}
+    else
+        ${_docker} start ${CNAME} >/dev/null
+    fi
+
+    # get container namespace PID
+    CPID=`${_docker} inspect --format {{.State.Pid}} ${CNAME}`  # get container namespace PID
+    if test -z ${CPID}; then
+        echo "Hoops: failled to start container=[${CNAME}]"
+        exit
+    fi
+
+    # if root ssh auth does not exist buit one from hypervisor
+    #test -f  /root/.ssh/authorized_keys
+    #if test $? -eq 0; then
+    #    ${_nsenter} -t ${CPID} --mount ls /root/.ssh/authorized_keys >/dev/null 2>/dev/null
+    #    if test $? -ne 0; then
+    #        echo "Setting container initial /root/.ssh/authorized_keys"
+    #        ${_nsenter} -t ${CPID} --mount mkdir -p /root/.ssh 2>/dev/null
+    #        ${_cat} /root/.ssh/authorized_keys | ${_nsenter} -t ${CPID} --mount tee /root/.ssh/authorized_keys >/dev/null
+    #    fi
+    #fi
+
+
+    # test if CNETNAME exists in ovs bridge ports
+    DIF=$(${_ovsctl} list-ports ${BRIDGE} | grep ${CNETNAME})
+    if [ ! -z ${DIF} ] && [ ${DIF} == ${CNETNAME} ]; then
+        ${_ovsctl} del-port $BRIDGE $CNETNAME                  # delete old interface from the bridge ports(ovs version)
+    fi
+
+    ${_ip} link add eth0 type veth peer name ${CNETNAME}       # create a new interface on hypervisor
+    ${_ip} link set ${CNETNAME}  up                             # activate newly create interface on host
+    #brctl addif $BRIDGE $CNETNAME                         # add new interface to the bridge
+    ${_ovsctl} add-port ${BRIDGE} ${CNETNAME}                  # add new interface to the bridge(ovs version)
+    ${_ip} link set netns ${CPID} dev eth0                     # move eth0 interface into container name space
+    ${_nsenter} -t ${CPID} --net ${_ip} link set eth0 up           # up eth0 within container
+    ${_nsenter} -t ${CPID} --net ${_ip} addr add  ${CADDR}/${NETMASK} dev eth0     # set IP addr within container
+    ${_nsenter} -t ${CPID} --net ${_ip} route add default via ${GATEWAY} dev eth0
+
+    # test networking
+    ${_docker} exec ${CNAME} ping -W 10 -c 1 ${GATEWAY} >/dev/null
+    if test $? -ne 0; then
+        echo "Warning: ${CNAME} started, but networking may has problems"
+        exit 1
+    else 
+        echo "OK: ${CNAME}@${CADDR} started, You can enter container: docker exec -it ${CNAME} bash"
+    fi
+;;
+
+stop) # 停止操作
+    if test -z "${DOCKRUNNING}"; then 
+        echo "Error: container=[${CNAME}] is not running"
+        exit 1
+    else
+        echo "Stopping running container=[${CNAME}]"
+    fi
+
+    ## stop the container
+    ${_docker} stop ${CNAME} >/dev/null
+    if test $? -eq 0; then
+        DIF=$(${_ovsctl} list-ports ${BRIDGE} | grep ${CNETNAME})
+        if [ ! -z ${DIF} ] && [ ${DIF} == ${CNETNAME} ]; then
+            ${_ovsctl} del-port $BRIDGE $CNETNAME                  # delete old interface from the bridge ports(ovs version)
+        else
+            echo "Warning: not found port(${CNETNAME}) in ovs"
+        fi
+        echo "Stopping container=[${CNAME}] Successful"
+    fi
+;;
+
+*) # 其他不认识的操作
+    echo "Error: Unknown Action"
+;;
+
+esac
