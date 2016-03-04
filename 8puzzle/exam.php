@@ -178,7 +178,8 @@ while($line = fgets(STDIN)){
     }
 }
 // 最大移动数, 假设超过这个数字, 基本就没希望了, 设置为数组维度平方*2+1(这个需要后续验证, 3x3维度下这应该是个安全的数)
-$maxMoves=count($input['matrix'])*count($input['matrix'])*2+1;
+$maxMoves=count($input['matrix'])*count($input['matrix'])*3+1;
+$maxMoves=30;
 
 while($moves<$maxMoves && false==$result=find($input,$moves)) {
     $moves++;
