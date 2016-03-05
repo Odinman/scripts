@@ -11,7 +11,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+var push, pop int
 
 // 盘面数据结构, 一个3x3 array
 type board [3][3]int
@@ -20,7 +23,7 @@ type board [3][3]int
 var Goal board = [3][3]int{{1, 2, 3}, {4, 5, 6}, {7, 8, 0}}
 
 //已经走过的盘面状态
-var pass map[float64]bool
+var pass map[float64]int
 
 // 一步
 type Step struct {
@@ -90,7 +93,8 @@ func (s *Step) calculate() (err error) {
 			}
 			// Inverse number, 求逆序数
 			for ii := i*3 + j + 1; ii < 9; ii++ { //从比当前更大的序号开始
-				if n > s.Current[ii/3][ii%3] { //前面的数大于后面的数, 逆序
+				tn := s.Current[ii/3][ii%3]
+				if n != 0 && tn != 0 && n > tn { //前面的数大于后面的数, 逆序(注意0应该忽略)
 					s.InverseNumber++
 				}
 			}
@@ -105,7 +109,7 @@ func (s *Step) calculate() (err error) {
  * 尝试所有可能移动(push到队列, 忽略已经pass的)
  */
 func (s *Step) TryMoves() {
-	pass[s.Checksum] = true
+	pass[s.Checksum] = len(s.Journey)
 	zi, zj := s.ZeroPos[0], s.ZeroPos[1]
 	//左
 	if zj-1 >= 0 {
@@ -113,6 +117,7 @@ func (s *Step) TryMoves() {
 		b[zi][zj-1] = 0
 		b[zi][zj] = s.Current[zi][zj-1]
 		ns, _ := NewStep(b)
+		//if depth, ok := pass[ns.Checksum]; !ok || depth > len(s.Journey)+1 {
 		if _, ok := pass[ns.Checksum]; !ok {
 			md := fmt.Sprintf("%d right", b[zi][zj])
 			if len(s.Journey) == 0 {
@@ -122,6 +127,7 @@ func (s *Step) TryMoves() {
 			}
 			//fmt.Printf("push: %s, hamming: %d, Manhattan: %d, total: %d\n", ns.Journey, ns.Hamming, ns.Manhattan, ns.Hamming+ns.Manhattan)
 			heap.Push(&que, ns)
+			push++
 		}
 	}
 	// 上
@@ -130,6 +136,7 @@ func (s *Step) TryMoves() {
 		b[zi-1][zj] = 0
 		b[zi][zj] = s.Current[zi-1][zj]
 		ns, _ := NewStep(b)
+		//if depth, ok := pass[ns.Checksum]; !ok || depth > len(s.Journey)+1 {
 		if _, ok := pass[ns.Checksum]; !ok {
 			md := fmt.Sprintf("%d down", b[zi][zj])
 			if len(s.Journey) == 0 {
@@ -139,6 +146,7 @@ func (s *Step) TryMoves() {
 			}
 			//fmt.Printf("push: %s, hamming: %d, Manhattan: %d, total: %d\n", ns.Journey, ns.Hamming, ns.Manhattan, ns.Hamming+ns.Manhattan)
 			heap.Push(&que, ns)
+			push++
 		}
 	}
 	// 右
@@ -147,6 +155,7 @@ func (s *Step) TryMoves() {
 		b[zi][zj+1] = 0
 		b[zi][zj] = s.Current[zi][zj+1]
 		ns, _ := NewStep(b)
+		//if depth, ok := pass[ns.Checksum]; !ok || depth > len(s.Journey)+1 {
 		if _, ok := pass[ns.Checksum]; !ok {
 			md := fmt.Sprintf("%d left", b[zi][zj])
 			if len(s.Journey) == 0 {
@@ -156,6 +165,7 @@ func (s *Step) TryMoves() {
 			}
 			//fmt.Printf("push: %s, hamming: %d, Manhattan: %d, total: %d\n", ns.Journey, ns.Hamming, ns.Manhattan, ns.Hamming+ns.Manhattan)
 			heap.Push(&que, ns)
+			push++
 		}
 	}
 	// 下
@@ -164,6 +174,7 @@ func (s *Step) TryMoves() {
 		b[zi+1][zj] = 0
 		b[zi][zj] = s.Current[zi+1][zj]
 		ns, _ := NewStep(b)
+		//if depth, ok := pass[ns.Checksum]; !ok || depth > len(s.Journey)+1 {
 		if _, ok := pass[ns.Checksum]; !ok {
 			md := fmt.Sprintf("%d up", b[zi][zj])
 			if len(s.Journey) == 0 {
@@ -173,6 +184,7 @@ func (s *Step) TryMoves() {
 			}
 			//fmt.Printf("push: %s, hamming: %d, Manhattan: %d, total: %d\n", ns.Journey, ns.Hamming, ns.Manhattan, ns.Hamming+ns.Manhattan)
 			heap.Push(&que, ns)
+			push++
 		}
 	}
 }
@@ -249,19 +261,22 @@ func main() {
 			initial[l][lj], _ = strconv.Atoi(s)
 		}
 	}
+	//从这里开始计时
+	begin := time.Now()
 
 	// 初始化队列
 	que = make(PQueue, 0)
 	heap.Init(&que)
 
 	// 记录已经走过的
-	pass = make(map[float64]bool)
+	pass = make(map[float64]int)
 
 	// 初始盘面状态
 	is, _ := NewStep(initial)
 	//fmt.Println("initial Inverse Number: ", is.InverseNumber)
 	// push到队列
 	heap.Push(&que, is)
+	push++
 
 	//目标盘面状态
 	gs, _ := NewStep(Goal)
@@ -274,6 +289,7 @@ func main() {
 		for que.Len() > 0 {
 			// 出列优先级最高的步
 			as = heap.Pop(&que).(*Step)
+			pop++
 			if as.isGoal() { //成功
 				as.Success = true
 				break
@@ -291,4 +307,6 @@ func main() {
 			fmt.Println("something wrong")
 		}
 	}
+	dura := time.Now().Sub(begin).String()
+	fmt.Printf("Status: push %d, pop %d\nduration: %s\n", push, pop, dura)
 }
